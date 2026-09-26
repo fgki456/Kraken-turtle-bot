@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Kraken Futures Turtle V2 paper simulation. No private API or order endpoint."""
+"""Kraken Futures Turtle V2 paper simulation with optional read-only account check."""
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -31,6 +35,37 @@ def get_json(path):
             return json.load(response)
     except (HTTPError, URLError, TimeoutError) as exc:
         raise RuntimeError(f"Kraken public API: {exc}") from exc
+
+
+def private_get(path, api_key, api_secret):
+    """Only GET endpoints are used; /derivatives is excluded from signature path."""
+    assert path in ("/derivatives/api/v3/accounts", "/derivatives/api/v3/openpositions")
+    endpoint = path.removeprefix("/derivatives")
+    digest = hashlib.sha256(endpoint.encode("utf-8")).digest()
+    signature = base64.b64encode(hmac.new(base64.b64decode(api_secret, validate=True),
+                                           digest, hashlib.sha512).digest()).decode("ascii")
+    req = Request(BASE + path, headers={"Accept": "application/json", "User-Agent": "turtle-v2-paper/1.1",
+                                        "APIKey": api_key, "Authent": signature}, method="GET")
+    with urlopen(req, timeout=15) as response:
+        data = json.load(response)
+    if not isinstance(data, dict) or data.get("result") != "success":
+        raise RuntimeError(f"Kraken read-only API rejected {endpoint}")
+    return data
+
+
+def check_real_account(api_key, api_secret):
+    """Report account connection separately from the paper strategy."""
+    try:
+        accounts = private_get("/derivatives/api/v3/accounts", api_key, api_secret)["accounts"]
+        positions = private_get("/derivatives/api/v3/openpositions", api_key, api_secret)["openPositions"]
+        if not isinstance(accounts, dict) or not isinstance(positions, list):
+            raise ValueError("Unexpected account response")
+        eur = accounts.get("flex", {}).get("currencies", {}).get("EUR", {}).get("quantity")
+        log.info("READ_ONLY CONNECTED real_futures_EUR=%s real_open_positions=%s",
+                 eur if eur is not None else "not_in_multi_collateral_wallet", len(positions))
+    except (HTTPError, URLError, TimeoutError, ValueError, KeyError, RuntimeError, binascii.Error) as exc:
+        # Avoid logging response bodies and credentials.
+        log.warning("READ_ONLY CHECK FAILED: %s", type(exc).__name__)
 
 
 def candles(symbol):
@@ -187,12 +222,18 @@ def main():
     journal = Journal(DB_PATH)
     prices = {}
     log.info("KRAKEN FUTURES TURTLE V2 PAPER START symbols=%s risk=%s USD max_notional=%s USD", ",".join(SYMBOLS), RISK, MAX_NOTIONAL)
+    api_key = os.getenv("KRAKEN_FUTURES_API_KEY", "").strip()
+    api_secret = os.getenv("KRAKEN_FUTURES_API_SECRET", "").strip()
+    if bool(api_key) != bool(api_secret):
+        log.warning("READ_ONLY CHECK DISABLED: provide both KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_API_SECRET")
     last_report = 0
     while True:
         run_once(journal, prices)
         if time.monotonic() - last_report >= REPORT:
             log.info("PAPER REPORT positions=%s prices=%s", len(journal.positions()),
                      ", ".join(f"{symbol}:{price}" for symbol, price in prices.items()) or "waiting for quotes")
+            if api_key and api_secret:
+                check_real_account(api_key, api_secret)
             last_report = time.monotonic()
         time.sleep(POLL)
 
