@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# PATCH: accept Kraken stop alias; bound emergency reductions 2026-09-28
+# PATCH: reconcile flat or already-saved entry markers safely 2026-09-28
 """Kraken Futures Turtle execution engine. Read-only preview is the default.
 
 Run as a separate process from main.py. Production orders require an explicit
@@ -19,33 +19,13 @@ import uuid
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from urllib.parse import urlencode
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from main import RISK, POLL, atr_before_signal, signal
-
-# Build 17: keep removed DOGS, ALICE, PYTH, XAU, and Brent manage-only. The bot
-# reconciles manually closed positions and protects any still-open saved
-# position, but never opens or adds to these markets.
-REMOVED_SYMBOLS = frozenset({
-    "PF_DOGSUSD", "PF_ALICEUSD", "PF_PYTHUSD", "PF_XAUUSD", "PF_BRENTOILUSD",
-    "PF_ACEUSD", "PF_ALGOUSD",
-})
-MANAGE_ONLY_SYMBOLS = REMOVED_SYMBOLS
-SYMBOLS = (
-    "PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_DOGEUSD",
-    "PF_STEEMUSD", "PF_ENAUSD", "PF_DOTUSD",
-    "PF_LINKUSD", "PF_INITUSD", "PF_ARUSD", "PF_MORPHOUSD",
-    "PF_1INCHUSD", "PF_KAITOUSD", "PF_WOOUSD", "PF_AXSUSD",
-)
-
-
-def is_configured_or_legacy(symbol):
-    return symbol in SYMBOLS or symbol in MANAGE_ONLY_SYMBOLS
+from main import SYMBOLS, RISK, POLL, atr_before_signal, signal
 
 log = logging.getLogger("turtle-live")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s UTC %(levelname)s %(message)s")
-BUILD_ID = "live-cross-margin-20261004-18-candle-diagnostic-20261013-2"
+BUILD_ID = "live-profit-lock-50pct-20260928-8"
 
 
 class Halt(RuntimeError):
@@ -69,19 +49,6 @@ def is_true(value):
     return value is True or (isinstance(value, str) and value.strip().lower() == "true")
 
 
-def is_stop_order(order):
-    """Kraken's openorders response may label a stop as either 'stp' or 'stop'."""
-    return str(order.get("orderType", "")).strip().lower() in {"stp", "stop"}
-
-
-def is_external_take_profit(order, saved):
-    """Recognize only a reduce-only take-profit closing the saved position."""
-    expected_side = "sell" if saved["side"] == "long" else "buy"
-    return (str(order.get("orderType", "")).strip().lower() == "take_profit"
-            and str(order.get("side", "")).strip().lower() == expected_side
-            and is_true(order.get("reduceOnly")))
-
-
 class Exchange:
     def __init__(self, key, secret, base):
         if base not in ("https://futures.kraken.com", "https://demo-futures.kraken.com"):
@@ -92,8 +59,7 @@ class Exchange:
 
     def request(self, endpoint, params=None, method="GET"):
         if endpoint not in {"/accounts", "/openpositions", "/openorders", "/instruments",
-                            "/sendorder", "/cancelorder", "/orders/status",
-                            "/leveragepreferences"}:
+                            "/sendorder", "/cancelorder", "/orders/status"}:
             raise ValueError("Unapproved API endpoint")
         encoded = urlencode(params or {})
         path = "/derivatives/api/v3" + endpoint
@@ -110,9 +76,6 @@ class Exchange:
         if method == "POST":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             request = Request(self.base + path, data=encoded.encode(), headers=headers, method="POST")
-        elif method == "PUT":
-            request = Request(self.base + path + ("?" + encoded if encoded else ""),
-                              headers=headers, method="PUT")
         else:
             request = Request(self.base + path + ("?" + encoded if encoded else ""), headers=headers)
         with urlopen(request, timeout=15) as response:
@@ -127,13 +90,6 @@ class Exchange:
             raise Halt("Unexpected openpositions response")
         return rows
 
-    def set_cross_margin(self, symbol):
-        # Kraken sets Cross when maxLeverage is omitted. This preference is
-        # contract-specific and cannot be changed while that contract has an
-        # open position, so callers must confirm the market is flat first.
-        self.request("/leveragepreferences", {"symbol": symbol}, "PUT")
-        log.info("MARGIN MODE SET %s Cross", symbol)
-
     def orders(self):
         rows = self.request("/openorders").get("openOrders")
         if not isinstance(rows, list):
@@ -147,17 +103,7 @@ class Exchange:
         return rows
 
     def instruments(self):
-        delay = 5
-        while True:
-            try:
-                rows = self.request("/instruments").get("instruments")
-                break
-            except HTTPError as exc:
-                if exc.code not in (429, 500, 502, 503, 504):
-                    raise
-                log.warning("Kraken /instruments HTTP %s; retrying in %ss", exc.code, delay)
-                time.sleep(delay)
-                delay = min(delay * 2, 60)
+        rows = self.request("/instruments").get("instruments")
         if not isinstance(rows, list):
             raise Halt("Unexpected instruments response")
         return {i["symbol"].upper(): i for i in rows}
@@ -388,7 +334,7 @@ class Engine:
             # An untracked live position stays halted; its strategy N is unknown.
             if action.startswith("enter:"):
                 symbol = action[len("enter:"):].upper()
-                if is_configured_or_legacy(symbol):
+                if symbol in SYMBOLS:
                     time.sleep(0.5)
                     positions, orders = self.ex.positions(), self.ex.orders()
                     matching_positions = [p for p in positions
@@ -396,9 +342,27 @@ class Engine:
                     symbol_orders = [o for o in orders
                                      if o.get("symbol", "").upper() == symbol]
                     if not matching_positions:
-                        # The pending marker does not persist an order ID, so an
-                        # orphan stop cannot be proven to belong to this entry.
-                        # Never cancel an unidentified user order automatically.
+                        # A manually closed entry can leave its reduce-only stop
+                        # resting. With two flat reads, cancel only the single
+                        # recognized stop created by this engine, then verify
+                        # flat/no-orders again before clearing this exact marker.
+                        if symbol_orders:
+                            orphan_stop = (len(symbol_orders) == 1
+                                           and symbol_orders[0].get("orderType") == "stp"
+                                           and is_true(symbol_orders[0].get("reduceOnly"))
+                                           and symbol_orders[0].get("order_id"))
+                            if orphan_stop:
+                                stop_id = symbol_orders[0]["order_id"]
+                                if any(p.get("symbol", "").upper() == symbol
+                                       for p in self.ex.positions()):
+                                    raise Halt("Position reappeared before orphan stop cleanup: " + symbol)
+                                self.ex.cancel(stop_id)
+                                time.sleep(0.5)
+                                positions, orders = self.ex.positions(), self.ex.orders()
+                                matching_positions = [p for p in positions
+                                                      if p.get("symbol", "").upper() == symbol]
+                                symbol_orders = [o for o in orders
+                                                 if o.get("symbol", "").upper() == symbol]
                         if not matching_positions and not symbol_orders:
                             self.state.recover_flat_action(action, symbol)
                             owned = self.state.items()
@@ -416,7 +380,7 @@ class Engine:
                     # reconstructed approximation. Keep the marker and halt for review.
             elif action.startswith("close:"):
                 symbol = action[len("close:"):].upper()
-                if is_configured_or_legacy(symbol):
+                if symbol in SYMBOLS:
                     time.sleep(0.5)
                     positions, orders = self.ex.positions(), self.ex.orders()
                     matching_positions = [p for p in positions
@@ -439,7 +403,7 @@ class Engine:
                             safe_stops = (bool(symbol_orders)
                                           and len(order_ids) == len(set(order_ids))
                                           and set(order_ids) == stop_ids
-                                          and all(is_stop_order(order)
+                                          and all(order.get("orderType") == "stp"
                                                   and is_true(order.get("reduceOnly"))
                                                   for order in symbol_orders))
                         if symbol_orders and safe_stops:
@@ -474,7 +438,7 @@ class Engine:
                               sum(p.get("symbol", "").upper() == symbol for p in positions),
                               sum(o.get("symbol", "").upper() == symbol for o in orders))
                 raise Halt(f"Pending action from prior run: {pending[0]!r}; exchange state is unresolved")
-        if any(not is_configured_or_legacy(symbol) for symbol in owned):
+        if any(symbol not in SYMBOLS for symbol in owned):
             raise Halt("A saved live position was removed from SYMBOLS")
         # A user may close a position directly in Kraken while this process is
         # down. Reconcile only when two exchange reads confirm flat and every
@@ -513,13 +477,8 @@ class Engine:
             positions, orders = final_positions, final_orders
             log.warning("Recovered manually closed position %s: flat confirmed twice; "
                         "saved stop orders reconciled and stale local state removed", symbol)
-        unmanaged_positions = []
-        for exchange_position in positions:
-            exchange_symbol = str(exchange_position.get("symbol", "")).upper()
-            if not exchange_symbol:
-                raise Halt("Exchange position has no symbol; no new orders")
-            if exchange_symbol not in owned:
-                unmanaged_positions.append(exchange_position)
+        if any(p.get("symbol", "").upper() not in owned for p in positions):
+            raise Halt("Unknown exchange position; no new orders")
         by_symbol = {p["symbol"].upper(): p for p in positions}
         allowed_stops = set()
         for symbol, saved in owned.items():
@@ -546,7 +505,7 @@ class Engine:
                 stop_side = str(stop.get("side", "")).lower()
                 remaining = dec(stop.get("unfilledSize", 0))
                 needed = dec(entry["size"])
-                valid_stop = (is_stop_order(stop)
+                valid_stop = (stop.get("orderType") == "stp"
                               and is_true(stop.get("reduceOnly"))
                               and stop.get("symbol", "").upper() == symbol
                               and stop_side == ("sell" if saved["side"] == "long" else "buy")
@@ -557,43 +516,8 @@ class Engine:
                               symbol, stop_id, stop.get("orderType"), stop.get("reduceOnly"),
                               stop.get("symbol"), stop.get("side"), remaining, needed)
                     raise Halt("Invalid protective stop: " + symbol)
-        # Positions and orders outside SQLite ownership are user's manual
-        # account activity. Keep managing validated bot-owned positions, but
-        # block all new entries/adds while any such exposure/order exists.
-        # A reduce-only take-profit can be manually attached to an existing
-        # bot symbol. In that case leave that symbol entirely to the user while
-        # continuing to validate its exchange stop and manage other symbols.
-        # Any other unrecognized order on a bot-owned symbol remains a hard halt.
-        unknown_orders = [o for o in orders if o.get("order_id") not in allowed_stops]
-        manual_take_profit_symbols = set()
-        for order in unknown_orders:
-            symbol = str(order.get("symbol", "")).upper()
-            if not symbol:
-                raise Halt("Exchange order has no symbol; no new orders")
-            if symbol in owned:
-                if is_external_take_profit(order, owned[symbol]):
-                    manual_take_profit_symbols.add(symbol)
-                    log.warning("MANUAL REDUCE-ONLY TAKE PROFIT; bot skips symbol=%s id=%s",
-                                symbol, order.get("order_id"))
-                    continue
-                log.error("UNRECOGNIZED ORDER ON BOT POSITION symbol=%s id=%s type=%r side=%r "
-                          "reduceOnly=%r",
-                          symbol, order.get("order_id"), order.get("orderType"),
-                          order.get("side"), order.get("reduceOnly"))
-                raise Halt("Unknown exchange order on bot-managed symbol: " + symbol)
-        unmanaged_activity_symbols = {
-            str(p.get("symbol", "")).upper() for p in unmanaged_positions
-        }
-        unmanaged_activity_symbols.update(
-            str(o.get("symbol", "")).upper() for o in unknown_orders
-        )
-        unmanaged_activity_symbols.update(manual_take_profit_symbols)
-        self.unmanaged_activity_symbols = unmanaged_activity_symbols
-        self.account_has_unmanaged_activity = bool(unmanaged_positions or unknown_orders)
-        if self.account_has_unmanaged_activity:
-            log.warning("UNMANAGED EXCHANGE ACTIVITY symbols=%s; bot-owned positions stay managed, "
-                        "new entries/adds are disabled",
-                        ",".join(sorted(unmanaged_activity_symbols)))
+        if any(o.get("order_id") not in allowed_stops for o in orders):
+            raise Halt("Unknown exchange order; no new orders")
         if pending_enter_to_clear or pending_close_to_clear:
             reconciled_action = pending_enter_to_clear or pending_close_to_clear
             self.state.clear_pending(reconciled_action)
@@ -649,68 +573,37 @@ class Engine:
                 time.sleep(0.35)
         raise Halt("Protective stop not confirmed on exchange: " + symbol)
 
-    def emergency_close(self, symbol, side, size, expected_remaining=Decimal(0)):
-        # Reduce only the requested amount, preserving any pre-existing units.
-        # A stop fill can race this request, so cap the reduction to the latest
-        # exchange size less the required residual position.
-        requested = dec(size)
-        expected_remaining = dec(expected_remaining)
-        if requested <= 0 or expected_remaining < 0:
-            raise Halt("Invalid emergency reduction amount: " + symbol)
+    def emergency_close(self, symbol, side, size):
+        # Stop creation may race a stop fill. Re-read immediately before sending
+        # so a stale size does not produce a rejected reduce-only order.
         actual = next((p for p in self.ex.positions()
                        if p.get("symbol", "").upper() == symbol), None)
         if actual is None:
-            if expected_remaining == 0:
-                log.critical("EMERGENCY CLOSE NOT NEEDED %s: exchange already flat", symbol)
-                return
-            raise Halt("Emergency reduction expected remaining position: " + symbol)
+            log.critical("EMERGENCY CLOSE NOT NEEDED %s: exchange already flat", symbol)
+            return
         if actual.get("side") != side:
             raise Halt("Emergency close side differs from exchange: " + symbol)
         actual_size = dec(actual.get("size", 0))
         if actual_size <= 0:
             raise Halt("Invalid exchange size during emergency close: " + symbol)
-        if actual_size < expected_remaining:
-            raise Halt("Position fell below expected residual before emergency reduction: " + symbol)
-        reduction = min(requested, actual_size - expected_remaining)
-        if reduction == 0:
-            log.critical("EMERGENCY REDUCTION NOT NEEDED %s: residual already=%s",
-                         symbol, actual_size)
-            return
         try:
             self.ex.send(orderType="mkt", symbol=symbol,
                          side="sell" if side == "long" else "buy",
-                         size=clean_number(reduction), reduceOnly="true",
+                         size=clean_number(actual_size), reduceOnly="true",
                          cliOrdId=str(uuid.uuid4()))
         except OrderRejected:
-            # The request may race a stop fill. Accept the rejection only if
-            # repeated exchange reads show exactly the expected residual size.
+            # Kraken rejects reduce-only when the position was closed in the
+            # brief interval between the position read and this request.
             for attempt in range(2):
-                current = next((p for p in self.ex.positions()
-                                if p.get("symbol", "").upper() == symbol), None)
-                current_size = dec(current.get("size", 0)) if current else Decimal(0)
-                if (current_size != expected_remaining
-                        or (current and current.get("side") != side)):
+                if any(p.get("symbol", "").upper() == symbol for p in self.ex.positions()):
                     raise
                 if attempt == 0:
                     time.sleep(0.5)
-            log.critical("EMERGENCY REDUCTION %s: rejected, but expected residual=%s confirmed twice",
-                         symbol, expected_remaining)
+            log.critical("EMERGENCY CLOSE %s: rejected, then exchange confirmed flat", symbol)
             return
-        # A market order can report placed before the position snapshot updates.
-        # Poll briefly, but never submit a second reduction on an uncertain result.
-        for attempt in range(5):
-            current = next((p for p in self.ex.positions()
-                            if p.get("symbol", "").upper() == symbol), None)
-            current_size = dec(current.get("size", 0)) if current else Decimal(0)
-            if current and current.get("side") != side:
-                raise Halt("Emergency reduction changed position side: " + symbol)
-            if current_size == expected_remaining:
-                log.critical("EMERGENCY REDUCTION VERIFIED %s reduced=%s residual=%s",
-                             symbol, reduction, expected_remaining)
-                return
-            if attempt < 4:
-                time.sleep(0.25)
-        raise Halt("Emergency reduction residual not confirmed: " + symbol)
+        if any(p.get("symbol", "").upper() == symbol for p in self.ex.positions()):
+            raise Halt("Emergency close incomplete; exchange position still open: " + symbol)
+        log.critical("EMERGENCY CLOSE VERIFIED %s", symbol)
 
     def enter(self, symbol, side, price, n, instrument, available):
         size = size_for(instrument, price, n, RISK, available)
@@ -721,11 +614,6 @@ class Engine:
                          instrument, side)
         if stop <= 0:
             return
-        # Force Cross before each new campaign. If Kraken refuses or the
-        # account/contract is not eligible, halt before sending an entry.
-        if any(p.get("symbol", "").upper() == symbol for p in self.ex.positions()):
-            raise Halt("Cannot set Cross for non-flat contract before entry: " + symbol)
-        self.ex.set_cross_margin(symbol)
         self.state.begin("enter:" + symbol)
         try:
             try:
@@ -843,7 +731,7 @@ class Engine:
                                + symbol) from exc
                 for entry in stop_entries:
                     matches = [o for o in symbol_orders if o.get("order_id") == entry["id"]]
-                    if (len(matches) != 1 or not is_stop_order(matches[0])
+                    if (len(matches) != 1 or matches[0].get("orderType") != "stp"
                             or not is_true(matches[0].get("reduceOnly"))
                             or str(matches[0].get("side", "")).lower() !=
                                 ("sell" if side == "long" else "buy")
@@ -866,8 +754,7 @@ class Engine:
             # Try to remove only the newly added size; existing stops stay on exchange.
             remaining = next((p for p in self.ex.positions() if p["symbol"].upper() == symbol), None)
             if remaining and dec(remaining["size"]) > old_size:
-                self.emergency_close(symbol, side, dec(remaining["size"]) - old_size,
-                                     expected_remaining=old_size)
+                self.emergency_close(symbol, side, dec(remaining["size"]) - old_size)
             raise Halt("Add-on unprotected; reduce-only reversal attempted: " + symbol)
         attached = json.loads(saved["stops"])
         attached.append({"id": stop_id, "size": str(extra)})
@@ -938,35 +825,17 @@ class Engine:
         log.info("LIVE CLOSE %s reason=%s", symbol, reason)
 
     def cycle(self):
-        positions = self.snapshot()  # Validate owned protection; isolate manual account activity.
+        positions = self.snapshot()  # Refuse all activity on unknown positions/orders.
         owned = self.state.items()
-        available = Decimal(0) if getattr(self, "account_has_unmanaged_activity", False) else self.cap
         total = Decimal(0)
         for symbol, saved in owned.items():
-            exchange_mark = dec(positions[symbol]["price"])
-            try:
-                _, current_price = self.ex.candles(symbol)
-            except Exception as exc:
-                # The exchange position snapshot has a current mark price even
-                # when its candle endpoint is temporarily stale. Use that mark
-                # for exposure accounting; the per-symbol scan below will skip
-                # strategy actions until fresh candles are available.
-                current_price = exchange_mark
-                log.warning("Using exchange mark for exposure on %s; candle data unavailable: %s",
-                            symbol, exc)
-            total += dec(saved["size"]) * max(current_price, exchange_mark)
-        cycle_symbols = (*SYMBOLS, *(symbol for symbol in MANAGE_ONLY_SYMBOLS if symbol in owned))
-        for symbol in cycle_symbols:
-            if symbol in MANAGE_ONLY_SYMBOLS and symbol not in owned:
-                log.info("SKIP REMOVED SYMBOL %s: no new entries", symbol)
-                continue
-            if symbol.upper() in getattr(self, "unmanaged_activity_symbols", set()):
-                log.warning("SKIP %s: exchange activity is not managed by this bot", symbol)
-                continue
+            _, current_price = self.ex.candles(symbol)  # Never underestimate exposure using an old entry.
+            total += dec(saved["size"]) * max(current_price, dec(positions[symbol]["price"]))
+        for symbol in SYMBOLS:
             try:
                 done, price = self.ex.candles(symbol)
             except Exception as exc:
-                log.warning("Candle check failed for %s: %s", symbol, exc)
+                log.warning("Candle check failed for %s: %s", symbol, type(exc).__name__)
                 continue
             bar = int(done[-1]["time"])
             saved = owned.get(symbol)
@@ -1026,11 +895,11 @@ class Engine:
                     if sign * (closed_price - exit_price) <= 0:
                         self.close(saved, "D5" if fast else "D10")
                         continue
-                if (symbol not in MANAGE_ONLY_SYMBOLS and saved["units"] < 4 and
+                if (saved["units"] < 4 and
                         sign * (price - entry) >= Decimal("0.75") * n * saved["units"]):
                     if not self.specs.get(symbol, {}).get("tradeable"):
                         raise Halt("Active market not tradeable: " + symbol)
-                    extra = self.add(saved, price, max(min(available, self.cap - total), Decimal(0)))
+                    extra = self.add(saved, price, max(self.cap - total, Decimal(0)))
                     total += extra * price * Decimal("1.01")
                 continue
             previous = self.state.bar(symbol)
@@ -1053,8 +922,7 @@ class Engine:
                 log.warning("SKIP %s: absent from Futures instruments", symbol)
                 continue
             try:
-                planned = size_for(spec, price, n, RISK,
-                                   max(min(available, self.cap - total), Decimal(0)))
+                planned = size_for(spec, price, n, RISK, max(self.cap - total, Decimal(0)))
             except (ValueError, KeyError) as exc:
                 log.warning("SKIP %s: %s", symbol, exc)
                 continue
@@ -1063,8 +931,7 @@ class Engine:
             if not self.armed:
                 log.info("PREVIEW SIGNAL %s %s theoretical_size=%s", symbol, side, planned)
                 continue
-            self.enter(symbol, side, price, n, spec,
-                       max(min(available, self.cap - total), Decimal(0)))
+            self.enter(symbol, side, price, n, spec, self.cap - total)
             total += planned * price
 
 
